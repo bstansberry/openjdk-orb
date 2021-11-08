@@ -31,10 +31,13 @@
 
 package com.sun.corba.se.impl.javax.rmi.CORBA; // Util (sed marker, don't remove!)
 
+import java.lang.reflect.InvocationTargetException;
 import java.rmi.RemoteException;
 import java.rmi.UnexpectedException;
 import java.rmi.MarshalException;
 import java.rmi.server.RMIClassLoader;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
 import java.util.Hashtable;
 import java.util.Enumeration;
 import java.util.Properties;
@@ -46,6 +49,7 @@ import java.lang.reflect.Constructor;
 
 import javax.rmi.CORBA.ValueHandler;
 import javax.rmi.CORBA.Tie;
+import javax.rmi.PortableRemoteObject;
 
 import java.security.AccessController;
 import java.security.PrivilegedAction;
@@ -56,10 +60,6 @@ import java.rmi.Remote;
 import java.rmi.ServerError;
 import java.rmi.ServerException;
 import java.rmi.ServerRuntimeException;
-
-import javax.transaction.TransactionRequiredException;
-import javax.transaction.TransactionRolledbackException;
-import javax.transaction.InvalidTransactionException;
 
 import org.jboss.javax.rmi.RemoteObjectSubstitutionManager;
 import org.omg.CORBA.SystemException;
@@ -131,6 +131,13 @@ public class Util implements javax.rmi.CORBA.UtilDelegate
                                                   CORBALogDomains.RPC_ENCODING);
 
     private static Util instance = null;
+
+    // Constructors to create JTA exceptions using reflection.
+    // Package of the exception class is dynamically determined in a static initializer below
+    // depending on whether jakarta namespace JTA is visible.
+    private static final Constructor<? extends RemoteException> TRANSACTION_REQUIRED_EXCEPTION;
+    private static final Constructor<? extends RemoteException> TRANSACTION_ROLLEDBACK_EXCEPTION;
+    private static final Constructor<? extends RemoteException> INVALID_TRANSACTION_EXCEPTION;
 
     public Util() {
         setInstance(this);
@@ -229,15 +236,15 @@ public class Util implements javax.rmi.CORBA.UtilDelegate
             newEx.detail = ex;
             return newEx;
         } else if (ex instanceof TRANSACTION_REQUIRED) {
-            RemoteException newEx = new TransactionRequiredException(message);
+            RemoteException newEx = constructTransactionException(TRANSACTION_REQUIRED_EXCEPTION, message);
             newEx.detail = ex;
             return newEx;
         } else if (ex instanceof TRANSACTION_ROLLEDBACK) {
-            RemoteException newEx = new TransactionRolledbackException(message);
+            RemoteException newEx = constructTransactionException(TRANSACTION_ROLLEDBACK_EXCEPTION, message);
             newEx.detail = ex;
             return newEx;
         } else if (ex instanceof INVALID_TRANSACTION) {
-            RemoteException newEx = new InvalidTransactionException(message);
+            RemoteException newEx = constructTransactionException(INVALID_TRANSACTION_EXCEPTION, message);
             newEx.detail = ex;
             return newEx;
         } else if (ex instanceof BAD_PARAM) {
@@ -750,6 +757,102 @@ public class Util implements javax.rmi.CORBA.UtilDelegate
                 (org.omg.CORBA_2_3.portable.InputStream)out.create_input_stream();
             return in.read_value();
         }
+    }
+
+    private static RemoteException constructTransactionException(Constructor<? extends RemoteException> constructor, String message) {
+        try {
+            return constructor.newInstance(message);
+        } catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static {
+
+        // Find the appropriate constructors to use to construct JTA exceptions when we map system exceptions
+        @SuppressWarnings("unchecked")
+        final Constructor<? extends RemoteException>[] constructors = new Constructor[3];
+        final Runnable r = () -> {
+
+            ClassLoader cl = Util.class.getClassLoader();
+            if (cl == null) {
+                cl = ClassLoader.getSystemClassLoader();
+            }
+
+            String prefix = "javax";
+            boolean hasJakartaJTA = false;
+            boolean hasJavaxJTA = false;
+            try {
+                // Build up the target class name to avoid javax<->jakarta transformation tools wanting to transform a FQCN constant
+                @SuppressWarnings("StringBufferReplaceableByString")
+                StringBuilder sb = new StringBuilder("jakarta");
+                sb.append(".transaction.Transaction");
+                cl.loadClass(sb.toString());
+                prefix = "jakarta";
+                hasJakartaJTA = true;
+            } catch (ClassNotFoundException ignored) {
+                // stick to javax
+            }
+
+            if (hasJakartaJTA) {
+                try {
+                    // Build up the target class name to avoid javax<->jakarta transformation tools wanting to transform a FQCN constant
+                    @SuppressWarnings("StringBufferReplaceableByString")
+                    StringBuilder sb = new StringBuilder("javax");
+                    sb.append(".transaction.TransactionRequiredException");
+                    cl.loadClass(sb.toString());
+                    hasJavaxJTA = true;
+                } catch (ClassNotFoundException ignored) {
+                    // ignore
+                }
+            }
+
+            // If there are multiple varieties of the JTA classes available, see if an explicit preference has been configured
+            // TODO perhaps default to jakarta.* if available and require some config to opt out
+            if (hasJakartaJTA && hasJavaxJTA) {
+                String prop = System.getProperty("openjdk-orb.corba.util.prefer.jakarta.transaction");
+                if (prop == null) {
+                     // WildFly specific hook, where they make a marker file available to our classloader.
+                     if (cl.getResource("openjdk-orb-corba-util-prefer-jakarta-transaction.txt") == null) {
+                         // No marker file; default to javax
+                         prefix = "javax";
+                     }
+                } else if (!"true".equalsIgnoreCase(prop)) {
+                    prefix = "javax";
+                }
+            }
+
+            // Load the desired constructors
+            try {
+                @SuppressWarnings("unchecked")
+                Class<? extends RemoteException> requiredClazz = (Class<? extends RemoteException>) cl.loadClass(prefix + ".transaction.TransactionRequiredException");
+                constructors[0] = requiredClazz.getConstructor(String.class);
+                @SuppressWarnings("unchecked")
+                Class<? extends RemoteException> rolledbackClazz = (Class<? extends RemoteException>) cl.loadClass(prefix + ".transaction.TransactionRolledbackException");
+                constructors[1] = rolledbackClazz.getConstructor(String.class);
+                @SuppressWarnings("unchecked")
+                Class<? extends RemoteException> invalidClazz = (Class<? extends RemoteException>) cl.loadClass(prefix + ".transaction.InvalidTransactionException");
+                constructors[2] = invalidClazz.getConstructor(String.class);
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
+                throw new RuntimeException(e);
+            }
+
+        };
+        if (System.getSecurityManager() == null) {
+            r.run();
+        } else {
+            try {
+                AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
+                    r.run();
+                    return null;
+                });
+            } catch (PrivilegedActionException e) {
+                throw new InternalError(e.getMessage());
+            }
+        }
+        TRANSACTION_REQUIRED_EXCEPTION = constructors[0];
+        TRANSACTION_ROLLEDBACK_EXCEPTION = constructors[1];
+        INVALID_TRANSACTION_EXCEPTION = constructors[2];
     }
 }
 
